@@ -1,0 +1,4 @@
+ricecooker
+jupyter
+BeautifulSoup4
+requests
