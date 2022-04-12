@@ -1,10 +1,14 @@
 import requests
-from bs4 import BeautifulSoup
+
+from bs4 import BeautifulSoup, element
 import re
 import os
 from ricecooker.chefs import SushiChef
 from ricecooker.classes import nodes, files, licenses
+from ricecooker.utils.html_writer import HTMLWriter
+from urllib.parse import urlparse, parse_qs
 from le_utils.constants.languages import getlang_by_name
+from le_utils.constants.roles import COACH,LEARNER
 
 KOLIBRI_API_KEY = 'bca1e71945d1456dc450211ebf1df799d63d5b7b'
 
@@ -18,15 +22,15 @@ CHANNEL_LANGUAGE = "en"  # Language of channel
 CHANNEL_DESCRIPTION = "A collection of multi-language folk songs and activities for primary students to learn languages, engage in collaboration and critical thinking, and develop intercultural skills. Contains folk songs, activity suggestions, and teacher training materials."  # Description of the channel (optional)
 CHANNEL_THUMBNAIL = "http://folkdc.eu/img/Folk8-200.png"  # Local path or url to image file (optional)
 CONTENT_ARCHIVE_VERSION = 1
-LICENSE = licenses.AllRightsLicense('Folk DC')
-
+LICENSE = licenses.CC_BY_NCLicense('FolkDC')
+AUTHOR = 'Digital Children’s Folksongs for Language and Cultural Learning'
 # Additional constants
 ################################################################################
 CREDENTIALS = os.path.join("credentials", "credentials.json")
-# AUDIO_FOLDER = os.path.abspath(os.path.join("chefdata", "audios"))
 AUDIO_FOLDER = os.path.join("chefdata", "audios")
-# PDF_FOLDER = os.path.abspath(os.path.join("chefdata", "pdfbooks"))
+VIDEO_FOLDER = os.path.join("chefdata", "videos")
 PDF_FOLDER = os.path.join("chefdata", "pdfbooks")
+ZIP_FOLDER = os.path.join('chefdata', 'zip')
 
 STATIC_URL_SONGS = "http://folkdc.eu/resources/folksongs/"
 STATIC_URL_ACTIVITIES = "http://folkdc.eu/handbook/"
@@ -46,11 +50,32 @@ class FolkDcChef(SushiChef):
         'CHANNEL_TITLE': CHANNEL_NAME,
         'CHANNEL_LANGUAGE': CHANNEL_LANGUAGE,
         'CHANNEL_DESCRIPTION': CHANNEL_DESCRIPTION,
+        'CHANNEL_THUMBNAIL':CHANNEL_THUMBNAIL
     }
     ASSETS_DIR = os.path.abspath('assets')
     DATA_DIR = os.path.abspath('chefdata')
     DOWNLOADS_DIR = os.path.join(DATA_DIR, 'downloads')
     ARCHIVE_DIR = os.path.join(DOWNLOADS_DIR, 'archive_{}'.format(CONTENT_ARCHIVE_VERSION))
+    TAGS = ['Music', 'Intercultural skills']
+
+    ydl_opts = {
+        'format': 'best',
+        'nooverwrites': True,
+        'outtmpl': VIDEO_FOLDER + "/%(id)s.%(ext)s"
+    }
+
+    def create_html_zip(self, directory, title, contents):
+        # Generate filepath to write zipfile
+        filename = "".join(x for x in title if x.isalnum())
+        write_to_path = "{}{}{}.zip".format(directory, os.path.sep, filename)
+
+        # Make directory for zip file if it doesn't exist already
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+        with HTMLWriter(write_to_path, mode="w") as zipper:
+            zipper.write_index_contents(contents)
+        return write_to_path
 
     def download_pdf_from_url(self, pdf_url):
         orig_filename = os.path.basename(pdf_url)
@@ -93,12 +118,18 @@ class FolkDcChef(SushiChef):
                 for td in tds:
                     if td.find('div'):
                         song_name = td.find('div').get_text()
+                        song_name = song_name.replace('&nbsp', ' ')
                         song_name = re.sub(r'[^A-Za-z0-9 ]+', '', song_name)
                         dict_tmp['song_name'] = song_name
                     elif td.find('a'):
                         url_link = td.find('a')
                         if url_link['href'].endswith('mp3'):
-                            dict_tmp['url_link'] = url_link['href']
+                            if dict_tmp['song_name'] == 'La bella lavanderina':
+                                index = str(url_link['href']).find('mp3')
+                                url_link_string = str(url_link['href'])[0:index + 3]
+                                dict_tmp['url_link'] = url_link_string
+                            else:
+                                dict_tmp['url_link'] = url_link['href']
                         if url_link['href'].endswith('pdf'):
                             dict_tmp['pdf_link'] = url_link['href']
                     else:
@@ -206,26 +237,107 @@ class FolkDcChef(SushiChef):
         if not os.path.exists(AUDIO_FOLDER):
             os.makedirs(AUDIO_FOLDER, exist_ok=True)
 
+        dict_introduction = self.scrapped_introduction()
         dict_scrapped_stuffs = {'songs': lst_dict_scrapped}
         dict_scrapped_stuffs.update(dict_activities)
+        dict_scrapped_stuffs['introduction'] = dict_introduction
         channel = self.upload_content(dict_scrapped_stuffs, channel)
 
         return channel
 
+    def scrapped_introduction(self):
+        response = SESSION.get('http://folkdc.eu/')
+        page = BeautifulSoup(response.text, 'html5lib')
+        div_content = page.find('div', {'class': 'entry_content'})
+        lst_text = []
+        video_url = ""
+        for content in div_content:
+            if type(content) == element.Tag:
+                if content.find('iframe'):
+                    video_url = content.find('iframe')['src']
+
+                else:
+                    text = str(content.text).replace('\n', ' ')
+                    text = re.sub(r'[^A-Za-z0-9,.:!@#$%^&*()/ ]+', '', text)
+                    if text:
+                        lst_text.append(text)
+        text = "<br><br>".join(lst_text)
+        dict_introduction = {'text': text, 'video_url': video_url}
+        return dict_introduction
+
+    def get_youtube_id_from_url(self, value):
+        """
+        Examples:
+        - http://youtu.be/SA2iWivDJiE
+        - http://www.youtube.com/watch?v=_oPAwA_Udwc&feature=feedu
+        - http://www.youtube.com/embed/SA2iWivDJiE
+        - http://www.youtube.com/v/SA2iWivDJiE?version=3&amp;hl=en_US
+        """
+        query = urlparse(value)
+        if query.hostname == 'youtu.be':
+            return query.path[1:]
+        if query.hostname in ('www.youtube.com', 'youtube.com'):
+            if query.path == '/watch':
+                p = parse_qs(query.query)
+                return p['v'][0]
+            if query.path[:7] == '/embed/':
+                return query.path.split('/')[2]
+            if query.path[:3] == '/v/':
+                return query.path.split('/')[2]
+        return None
+
     def upload_content(self, dict_content, channel):
+
+        dict_introduction = dict_content.get('introduction')
+        introduction_node = nodes.TopicNode(
+            title='Introduction',
+            source_id='Folk DC introduction',
+            description='Folk DC Introduction',
+            tags=self.TAGS,
+        )
+        youtube_url = dict_introduction.get('video_url')
+        youtube_id = self.get_youtube_id_from_url(youtube_url)
+
+        video_node = nodes.VideoNode(
+            source_id=youtube_id,
+            title="Introduction video",
+            license=licenses.CC_BY_NCLicense(copyright_holder='Folk  DC'),
+            language="en",
+            derive_thumbnail=True,
+            files=[files.YouTubeVideoFile(youtube_id)],
+            role=COACH
+        )
+
+        write_to_path = self.create_html_zip(ZIP_FOLDER, "Introduction", dict_introduction.get('text'))
+
+        html_file = files.HTMLZipFile(write_to_path)
+
+        html_node = nodes.HTML5AppNode(
+            title='Introduction HTML',
+            source_id='Introduction html',
+            tags=self.TAGS,
+            files=[html_file],
+            license=LICENSE,
+            role=COACH
+        )
+        introduction_node.add_child(html_node)
+        introduction_node.add_child(video_node)
+
         song_node = nodes.TopicNode(
             title="Songs",
             source_id="Songs",
-            description="All songs"
+            description="All songs",
+            tags=self.TAGS
         )
         lst_dict_items = dict_content.get('songs')
         for dict_item in lst_dict_items:
             language_node = nodes.TopicNode(
                 title=dict_item.get('song_name'),
                 source_id=dict_item.get('song_name'),
-                author="FolkDC",
+                author=AUTHOR,
                 description="",
-                language=getlang_by_name(dict_item.get('language'))
+                language=getlang_by_name(dict_item.get('language')),
+                tags=self.TAGS
             )
 
             audio_file = files.AudioFile(path=dict_item.get('audio_path'))
@@ -251,7 +363,7 @@ class FolkDcChef(SushiChef):
         activity_main_node = nodes.TopicNode(
             title="Activities",
             source_id="Activities",
-            author="FolkDC",
+            author=AUTHOR,
             description="Activities",
             language=getlang_by_name("Activities")
         )
@@ -260,9 +372,10 @@ class FolkDcChef(SushiChef):
             activity_node = nodes.TopicNode(
                 title=key,
                 source_id=key,
-                author="FolkDC",
+                author=AUTHOR,
                 description="Activities",
-                language=getlang_by_name(key)
+                language=getlang_by_name(key),
+
             )
             for dict_item in lst_activities:
                 pdf_node = nodes.DocumentNode(
@@ -271,12 +384,15 @@ class FolkDcChef(SushiChef):
                     description='Activity',
                     language=getlang_by_name(dict_item.get('pdf_name')),
                     license=LICENSE,
-                    files=[files.DocumentFile(dict_item.get('pdf_path'))]
+                    files=[files.DocumentFile(dict_item.get('pdf_path'))],
+                    role=COACH
+
                 )
                 activity_node.add_child(pdf_node)
             activity_main_node.add_child(activity_node)
         channel.add_child(activity_main_node)
         channel.add_child(song_node)
+        channel.add_child(introduction_node)
         return channel
 
 
@@ -286,3 +402,4 @@ if __name__ == '__main__':
     # This code runs when sushichef.py is called from the command line
     chef = FolkDcChef()
     chef.main()
+

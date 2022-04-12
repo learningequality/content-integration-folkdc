@@ -2,3 +2,4 @@ ricecooker
 jupyter
 BeautifulSoup4
 requests
+ffmpeg
